@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autospace"
+version = "0.1.0"
+description = "Launch Linux desktop app presets and move windows to configured workspaces."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+autospace = "autospace.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

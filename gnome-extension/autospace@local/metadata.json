@@ -1,0 +1,6 @@
+{
+  "uuid": "autospace@local",
+  "name": "autospace Window Control",
+  "description": "D-Bus window control bridge for the autospace CLI.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"]
+}
