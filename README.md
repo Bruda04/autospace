@@ -147,7 +147,8 @@ apps:
   - name: Firefox
     command: firefox
     workspace: 1
-    monitor: 1
+    monitor: primary
+    maximized: true
     reuse_existing: true
     match:
       wm_class: firefox
@@ -155,7 +156,7 @@ apps:
   - name: Editor
     command: code /home/user/projects/example
     workspace: 2
-    monitor: 1
+    monitor: primary
     match:
       wm_class: code
 ```
@@ -165,12 +166,19 @@ Supported app fields:
 - `name`: human-readable application name.
 - `command`: command used to launch the application.
 - `workspace`: target workspace, 1-based.
-- `monitor`: optional target monitor, 1-based.
+- `monitor`: optional target monitor, either a 1-based monitor number or
+  `primary` on GNOME Wayland.
+- `maximized`: maximize the window after placement.
 - `reuse_existing`: move an existing matching window instead of launching a new
   one.
-- `focus`: focus the window after moving it.
+- `restart_if_no_window`: when no matching window exists, terminate existing
+  processes for the same command executable before launching. This is useful for
+  single-instance apps that can keep a background process alive without a
+  top-level window.
+- `focus`: focus the window after the run finishes. If multiple apps set this,
+  the last focused app in preset order wins.
 - `delay`: seconds to wait immediately after launching before polling.
-- `timeout`: seconds to wait for a matching window.
+- `timeout`: seconds to keep the placement request active while matching windows appear.
 - `match`: window matching rule.
 
 Supported match keys:
@@ -191,12 +199,25 @@ GNOME Wayland support uses the bundled extension in
 API used by the CLI:
 
 - `ListWindows()`
+- `ListMonitors()`
 - `MoveWindowToWorkspace(window_id, workspace_index)`
 - `MoveWindowToMonitor(window_id, monitor_index)`
+- `PlaceMatchingWindow(match_json, workspace_index, monitor_index, maximized, timeout_ms)`
 - `ActivateWindow(window_id)`
 
 The YAML config uses 1-based workspace and monitor numbers. The backend API uses
-0-based indices internally.
+0-based indices internally. For GNOME setups where workspaces exist only on the
+primary monitor, prefer `monitor: primary`; the extension resolves it through
+GNOME Shell at runtime.
+
+For GNOME Wayland, `autospace` uses event-driven placement through
+`PlaceMatchingWindow`. The extension listens for new GNOME Shell windows and
+applies monitor, workspace, and maximized state after matching windows are
+registered by the compositor. The placement request remains active until the app
+timeout expires, so splash screens and later main windows are handled by the same
+desired-state reconciliation. The CLI starts apps in parallel for this backend
+and reports success only after a matching window is observed in the requested
+state.
 
 ### X11
 

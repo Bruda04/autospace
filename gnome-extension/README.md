@@ -3,6 +3,11 @@
 This extension exposes a small session D-Bus API that lets the `autospace` CLI
 list windows and move them between workspaces on GNOME Wayland.
 
+It also supports event-driven placement through `PlaceMatchingWindow`, which
+waits inside GNOME Shell for matching windows and then applies monitor,
+workspace, and maximized state. `ListMonitors` exposes GNOME Shell's monitor
+order and primary monitor so the CLI can support `monitor: primary`.
+
 Install locally:
 
 ```bash

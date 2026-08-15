@@ -5,12 +5,17 @@ import {Extension} from "resource:///org/gnome/shell/extensions/extension.js";
 
 const BUS_NAME = "org.autospace.WindowControl";
 const OBJECT_PATH = "/org/autospace/WindowControl";
+const NO_MONITOR_INDEX = -1;
+const PRIMARY_MONITOR_INDEX = -2;
 
 const IFACE_XML = `
 <node>
   <interface name="org.autospace.WindowControl">
     <method name="ListWindows">
       <arg type="s" direction="out" name="windows_json"/>
+    </method>
+    <method name="ListMonitors">
+      <arg type="s" direction="out" name="monitors_json"/>
     </method>
     <method name="MoveWindowToWorkspace">
       <arg type="s" direction="in" name="window_id"/>
@@ -20,6 +25,14 @@ const IFACE_XML = `
     <method name="MoveWindowToMonitor">
       <arg type="s" direction="in" name="window_id"/>
       <arg type="i" direction="in" name="monitor_index"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="PlaceMatchingWindow">
+      <arg type="s" direction="in" name="match_json"/>
+      <arg type="i" direction="in" name="workspace_index"/>
+      <arg type="i" direction="in" name="monitor_index"/>
+      <arg type="b" direction="in" name="maximized"/>
+      <arg type="i" direction="in" name="timeout_ms"/>
       <arg type="b" direction="out" name="ok"/>
     </method>
     <method name="ActivateWindow">
@@ -34,6 +47,10 @@ class WindowControlService {
     this._nextId = 1;
     this._idsBySignature = new Map();
     this._windowsById = new Map();
+    this._pendingPlacements = [];
+    this._reconcileIntervalMs = 500;
+    this._signalIds = [];
+    this._connectWindowSignals();
   }
 
   ListWindows() {
@@ -46,8 +63,27 @@ class WindowControlService {
       pid: window.get_pid?.() ?? null,
       workspace: window.get_workspace()?.index() ?? null,
       monitor: window.get_monitor?.() ?? null,
+      maximized: window.get_maximized?.() === Meta.MaximizeFlags.BOTH,
+      fullscreen: window.is_fullscreen?.() ?? window.fullscreen ?? false,
     }));
     return JSON.stringify(windows);
+  }
+
+  ListMonitors() {
+    const primaryMonitor = global.display.get_primary_monitor();
+    const monitors = [];
+    for (let index = 0; index < global.display.get_n_monitors(); index++) {
+      const geometry = global.display.get_monitor_geometry(index);
+      monitors.push({
+        index,
+        primary: index === primaryMonitor,
+        x: geometry.x,
+        y: geometry.y,
+        width: geometry.width,
+        height: geometry.height,
+      });
+    }
+    return JSON.stringify(monitors);
   }
 
   MoveWindowToWorkspace(windowId, workspaceIndex) {
@@ -62,7 +98,7 @@ class WindowControlService {
       return false;
 
     window.change_workspace_by_index(workspaceIndex, false);
-    return true;
+    return window.get_workspace?.()?.index() === workspaceIndex;
   }
 
   MoveWindowToMonitor(windowId, monitorIndex) {
@@ -71,11 +107,48 @@ class WindowControlService {
     if (!window)
       return false;
 
+    const resolvedMonitorIndex = this._resolveMonitorIndex(monitorIndex);
     const monitorCount = global.display.get_n_monitors();
-    if (monitorIndex < 0 || monitorIndex >= monitorCount)
+    if (resolvedMonitorIndex < 0 || resolvedMonitorIndex >= monitorCount)
       return false;
 
-    window.move_to_monitor(monitorIndex);
+    this._moveWindowToMonitor(window, resolvedMonitorIndex);
+    return window.get_monitor?.() === resolvedMonitorIndex;
+  }
+
+  PlaceMatchingWindow(matchJson, workspaceIndex, monitorIndex, maximized, timeoutMs) {
+    let match;
+    try {
+      match = JSON.parse(matchJson);
+    } catch {
+      return false;
+    }
+
+    if (!this._validWorkspace(workspaceIndex))
+      return false;
+    const resolvedMonitorIndex = this._resolveMonitorIndex(monitorIndex);
+    if (resolvedMonitorIndex !== NO_MONITOR_INDEX && !this._validMonitor(resolvedMonitorIndex))
+      return false;
+
+    const placement = {
+      match,
+      workspaceIndex,
+      monitorIndex,
+      maximized,
+      timeoutId: 0,
+      reconcileId: 0,
+    };
+    placement.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.max(1, timeoutMs), () => {
+      placement.timeoutId = 0;
+      this._removePendingPlacement(placement, {removeSources: false});
+      return GLib.SOURCE_REMOVE;
+    });
+    placement.reconcileId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._reconcileIntervalMs, () => {
+      this._reconcilePlacement(placement);
+      return this._pendingPlacements.includes(placement) ? GLib.SOURCE_CONTINUE : GLib.SOURCE_REMOVE;
+    });
+    this._pendingPlacements.push(placement);
+    this._reconcilePlacement(placement);
     return true;
   }
 
@@ -105,6 +178,149 @@ class WindowControlService {
       nextWindowsById.set(id, window);
     }
     this._windowsById = nextWindowsById;
+  }
+
+  _connectWindowSignals() {
+    this._signalIds.push([global.display, global.display.connect('window-created', (_display, window) => {
+      this._handleWindowEvent(window);
+    })]);
+
+    const manager = global.workspace_manager;
+    for (let i = 0; i < manager.get_n_workspaces(); i++) {
+      const workspace = manager.get_workspace_by_index(i);
+      this._signalIds.push([workspace, workspace.connect('window-added', (_workspace, window) => {
+        this._handleWindowEvent(window);
+      })]);
+    }
+  }
+
+  disconnectSignals() {
+    for (const [object, signalId] of this._signalIds)
+      object.disconnect(signalId);
+    this._signalIds = [];
+    for (const placement of [...this._pendingPlacements]) {
+      this._removePendingPlacement(placement);
+    }
+    this._pendingPlacements = [];
+  }
+
+  _handleWindowEvent(window) {
+    if (!window || this._pendingPlacements.length === 0)
+      return;
+
+    for (const placement of [...this._pendingPlacements]) {
+      if (!this._windowMatches(window, placement.match))
+        continue;
+
+      this._placeWindow(window, placement.workspaceIndex, placement.monitorIndex, placement.maximized);
+    }
+  }
+
+  _reconcilePlacement(placement) {
+    this._refreshWindows();
+    for (const window of this._windowsById.values()) {
+      if (!this._windowMatches(window, placement.match))
+        continue;
+
+      this._placeWindow(window, placement.workspaceIndex, placement.monitorIndex, placement.maximized);
+    }
+  }
+
+  _windowMatches(window, match) {
+    if (!window || window.skip_taskbar || window.get_window_type() !== Meta.WindowType.NORMAL)
+      return false;
+    if (match.app_id && this._normalize(window.get_gtk_application_id?.()) !== this._normalize(match.app_id))
+      return false;
+    if (match.wm_class && this._normalize(window.get_wm_class()) !== this._normalize(match.wm_class))
+      return false;
+    if (match.title && !this._normalize(window.get_title()).includes(this._normalize(match.title)))
+      return false;
+    if (match.pid !== undefined && match.pid !== null && window.get_pid?.() !== match.pid)
+      return false;
+    return true;
+  }
+
+  _placeWindow(window, workspaceIndex, monitorIndex, maximized) {
+    if (!window || window.skip_taskbar || window.get_window_type() !== Meta.WindowType.NORMAL)
+      return;
+
+    const resolvedMonitorIndex = this._resolveMonitorIndex(monitorIndex);
+    if (resolvedMonitorIndex >= 0 && window.get_monitor?.() !== resolvedMonitorIndex)
+      this._moveWindowToMonitor(window, resolvedMonitorIndex);
+
+    this._queuePlacementStep(() => {
+      if (window.get_workspace?.()?.index() !== workspaceIndex)
+        window.change_workspace_by_index(workspaceIndex, false);
+      this._queuePlacementStep(() => {
+        if (window.get_workspace?.()?.index() !== workspaceIndex)
+          window.change_workspace_by_index(workspaceIndex, false);
+        if (maximized)
+          this._maximizeWindow(window);
+      });
+    });
+  }
+
+  _queuePlacementStep(callback) {
+    GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+      callback();
+      return GLib.SOURCE_REMOVE;
+    });
+  }
+
+  _maximizeWindow(window) {
+    if (window.get_maximized?.() === Meta.MaximizeFlags.BOTH)
+      return;
+    if (window.maximize.length === 0)
+      window.maximize();
+    else
+      window.maximize(Meta.MaximizeFlags.BOTH);
+  }
+
+  _moveWindowToMonitor(window, monitorIndex) {
+    window.move_to_monitor(monitorIndex);
+    if (window.get_monitor?.() === monitorIndex)
+      return;
+
+    const geometry = global.display.get_monitor_geometry(monitorIndex);
+    const frame = window.get_frame_rect?.();
+    const width = frame?.width ?? 0;
+    const height = frame?.height ?? 0;
+    const x = geometry.x + Math.max(0, Math.floor((geometry.width - width) / 2));
+    const y = geometry.y + Math.max(0, Math.floor((geometry.height - height) / 2));
+    window.move_frame(false, x, y);
+  }
+
+  _removePendingPlacement(placement, {removeSources = true} = {}) {
+    const index = this._pendingPlacements.indexOf(placement);
+    if (index !== -1)
+      this._pendingPlacements.splice(index, 1);
+    if (removeSources && placement.timeoutId) {
+      GLib.source_remove(placement.timeoutId);
+    }
+    if (removeSources && placement.reconcileId) {
+      GLib.source_remove(placement.reconcileId);
+    }
+    placement.timeoutId = 0;
+    placement.reconcileId = 0;
+  }
+
+  _validWorkspace(workspaceIndex) {
+    const manager = global.workspace_manager;
+    return workspaceIndex >= 0 && workspaceIndex < manager.get_n_workspaces();
+  }
+
+  _validMonitor(monitorIndex) {
+    return monitorIndex >= 0 && monitorIndex < global.display.get_n_monitors();
+  }
+
+  _resolveMonitorIndex(monitorIndex) {
+    if (monitorIndex === PRIMARY_MONITOR_INDEX)
+      return global.display.get_primary_monitor();
+    return monitorIndex;
+  }
+
+  _normalize(value) {
+    return String(value ?? '').toLocaleLowerCase();
   }
 
   _signature(window) {
@@ -138,6 +354,8 @@ export default class AutospaceExtension extends Extension {
       this._dbus.unexport();
       this._dbus = null;
     }
+    if (this._service)
+      this._service.disconnectSignals();
     this._service = null;
   }
 }

@@ -7,7 +7,10 @@ import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from autospace.models import Window
+from autospace.models import MatchRule, Monitor, Window
+
+NO_MONITOR_INDEX = -1
+PRIMARY_MONITOR_INDEX = -2
 
 
 class BackendError(RuntimeError):
@@ -29,12 +32,25 @@ class WindowBackend(ABC):
     def list_windows(self) -> list[Window]:
         raise NotImplementedError
 
+    def list_monitors(self) -> list[Monitor]:
+        return []
+
     @abstractmethod
     def move_to_workspace(self, window_id: str, workspace_index: int) -> None:
         raise NotImplementedError
 
     def move_to_monitor(self, window_id: str, monitor_index: int) -> None:
         raise BackendError(f"{self.name} does not support monitor targeting")
+
+    def place_matching_window(
+        self,
+        match: MatchRule,
+        workspace_index: int,
+        monitor_index: int | None,
+        maximized: bool,
+        timeout: float,
+    ) -> None:
+        raise BackendError(f"{self.name} does not support event-driven placement")
 
     def activate(self, window_id: str) -> None:
         return None
@@ -77,6 +93,14 @@ class GnomeWaylandBackend(WindowBackend):
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise BackendError(f"invalid ListWindows response: {payload}") from exc
 
+    def list_monitors(self) -> list[Monitor]:
+        payload = self._call("ListMonitors")
+        try:
+            data = json.loads(_unwrap_gdbus_string(payload))
+            return [Monitor.from_dict(item) for item in data]
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise BackendError(f"invalid ListMonitors response: {payload}") from exc
+
     def move_to_workspace(self, window_id: str, workspace_index: int) -> None:
         result = self._call("MoveWindowToWorkspace", window_id, workspace_index)
         if "true" not in result.lower():
@@ -85,7 +109,28 @@ class GnomeWaylandBackend(WindowBackend):
     def move_to_monitor(self, window_id: str, monitor_index: int) -> None:
         result = self._call("MoveWindowToMonitor", window_id, monitor_index)
         if "true" not in result.lower():
-            raise BackendError(f"failed to move window {window_id} to monitor {monitor_index + 1}")
+            raise BackendError(f"failed to move window {window_id} to monitor {_monitor_label(monitor_index)}")
+
+    def place_matching_window(
+        self,
+        match: MatchRule,
+        workspace_index: int,
+        monitor_index: int | None,
+        maximized: bool,
+        timeout: float,
+    ) -> None:
+        monitor_arg = NO_MONITOR_INDEX if monitor_index is None else monitor_index
+        timeout_ms = max(1, int(timeout * 1000))
+        result = self._call(
+            "PlaceMatchingWindow",
+            json.dumps(_match_payload(match)),
+            workspace_index,
+            monitor_arg,
+            maximized,
+            timeout_ms,
+        )
+        if "true" not in result.lower():
+            raise BackendError("failed to schedule event-driven window placement")
 
     def activate(self, window_id: str) -> None:
         self._call("ActivateWindow", window_id)
@@ -203,6 +248,22 @@ def backend_report(env: dict[str, str] | None = None) -> list[str]:
         status = "available" if backend.available() else "unavailable"
         lines.append(f"{backend.name}: {status}")
         lines.extend(f"  - {line}" for line in backend.diagnostics())
+        if status == "available":
+            try:
+                monitors = backend.list_monitors()
+            except BackendError as exc:
+                lines.append(f"  - monitor details unavailable: {exc}")
+                monitors = []
+            if monitors:
+                lines.append("  - monitors:")
+                for monitor in monitors:
+                    geometry = ""
+                    if monitor.width is not None and monitor.height is not None:
+                        x = monitor.x or 0
+                        y = monitor.y or 0
+                        geometry = f" {monitor.width}x{monitor.height}+{x}+{y}"
+                    primary = " primary" if monitor.primary else ""
+                    lines.append(f"    - {monitor.index + 1}:{geometry}{primary}")
     return lines
 
 
@@ -218,4 +279,29 @@ def _unwrap_gdbus_string(output: str) -> str:
 def _gvariant_arg(value: object) -> str:
     if isinstance(value, str):
         return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and value < 0:
+        return f"int32 {value}"
     return str(value)
+
+
+def _match_payload(match: MatchRule) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    if match.app_id:
+        payload["app_id"] = match.app_id
+    if match.wm_class:
+        payload["wm_class"] = match.wm_class
+    if match.title:
+        payload["title"] = match.title
+    if match.pid is not None:
+        payload["pid"] = match.pid
+    return payload
+
+
+def _monitor_label(monitor_index: int) -> str:
+    if monitor_index == PRIMARY_MONITOR_INDEX:
+        return "primary"
+    if monitor_index >= 0:
+        return str(monitor_index + 1)
+    return str(monitor_index)

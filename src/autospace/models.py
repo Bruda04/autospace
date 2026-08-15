@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+MonitorTarget = int | Literal["primary"]
 
 
 @dataclass(frozen=True)
@@ -33,11 +35,13 @@ class AppConfig:
     command: str
     workspace: int
     match: MatchRule
-    monitor: int | None = None
+    monitor: MonitorTarget | None = None
+    maximized: bool = False
     delay: float = 0.0
     timeout: float = 20.0
     focus: bool = False
     reuse_existing: bool = False
+    restart_if_no_window: bool = False
 
     @classmethod
     def from_dict(cls, data: Any) -> "AppConfig":
@@ -49,8 +53,8 @@ class AppConfig:
         workspace = _required_int(data, "workspace")
         if workspace < 1:
             raise ValueError(f"{name}: workspace must be >= 1")
-        monitor = _optional_int(data, "monitor")
-        if monitor is not None and monitor < 1:
+        monitor = _optional_monitor(data, "monitor")
+        if isinstance(monitor, int) and monitor < 1:
             raise ValueError(f"{name}: monitor must be >= 1")
 
         delay = _optional_float(data, "delay", default=0.0)
@@ -65,11 +69,13 @@ class AppConfig:
             command=command,
             workspace=workspace,
             monitor=monitor,
+            maximized=_optional_bool(data, "maximized", default=False),
             match=MatchRule.from_dict(data.get("match")),
             delay=delay,
             timeout=timeout,
             focus=_optional_bool(data, "focus", default=False),
             reuse_existing=_optional_bool(data, "reuse_existing", default=False),
+            restart_if_no_window=_optional_bool(data, "restart_if_no_window", default=False),
         )
 
 
@@ -100,6 +106,8 @@ class Window:
     pid: int | None = None
     workspace: int | None = None
     monitor: int | None = None
+    maximized: bool | None = None
+    fullscreen: bool | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Window":
@@ -111,6 +119,29 @@ class Window:
             pid=_coerce_optional_int(data.get("pid")),
             workspace=_coerce_optional_int(data.get("workspace")),
             monitor=_coerce_optional_int(data.get("monitor")),
+            maximized=_coerce_optional_bool(data.get("maximized")),
+            fullscreen=_coerce_optional_bool(data.get("fullscreen")),
+        )
+
+
+@dataclass(frozen=True)
+class Monitor:
+    index: int
+    primary: bool = False
+    x: int | None = None
+    y: int | None = None
+    width: int | None = None
+    height: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Monitor":
+        return cls(
+            index=_coerce_required_int(data.get("index"), field_name="index"),
+            primary=_coerce_optional_bool(data.get("primary")) or False,
+            x=_coerce_optional_int(data.get("x")),
+            y=_coerce_optional_int(data.get("y")),
+            width=_coerce_optional_int(data.get("width")),
+            height=_coerce_optional_int(data.get("height")),
         )
 
 
@@ -139,6 +170,17 @@ def _required_int(data: dict[str, Any], key: str) -> int:
 
 def _optional_int(data: dict[str, Any], key: str) -> int | None:
     value = data.get(key)
+    return _coerce_optional_int(value, field_name=key)
+
+
+def _optional_monitor(data: dict[str, Any], key: str) -> MonitorTarget | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.strip().casefold() == "primary":
+            return "primary"
+        raise ValueError(f"{key} must be an integer or 'primary'")
     return _coerce_optional_int(value, field_name=key)
 
 
@@ -171,3 +213,18 @@ def _coerce_optional_int(value: Any, *, field_name: str = "value") -> int | None
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be an integer") from exc
+
+
+def _coerce_required_int(value: Any, *, field_name: str = "value") -> int:
+    coerced = _coerce_optional_int(value, field_name=field_name)
+    if coerced is None:
+        raise ValueError(f"{field_name} must be an integer")
+    return coerced
+
+
+def _coerce_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError("value must be true or false")
+    return value
