@@ -3,6 +3,7 @@ apps:
   - name: Firefox
     command: firefox
     workspace: 1
+    monitor: primary
     reuse_existing: true
     match:
       wm_class: firefox
@@ -10,5 +11,6 @@ apps:
   - name: Terminal
     command: gnome-terminal
     workspace: 2
+    monitor: primary
     match:
       wm_class: gnome-terminal
