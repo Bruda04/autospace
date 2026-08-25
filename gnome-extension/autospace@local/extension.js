@@ -112,7 +112,8 @@ class WindowControlService {
     if (resolvedMonitorIndex < 0 || resolvedMonitorIndex >= monitorCount)
       return false;
 
-    this._moveWindowToMonitor(window, resolvedMonitorIndex);
+    if (!this._moveWindowToMonitor(window, resolvedMonitorIndex))
+      return false;
     return window.get_monitor?.() === resolvedMonitorIndex;
   }
 
@@ -209,20 +210,28 @@ class WindowControlService {
       return;
 
     for (const placement of [...this._pendingPlacements]) {
-      if (!this._windowMatches(window, placement.match))
-        continue;
+      try {
+        if (!this._windowMatches(window, placement.match))
+          continue;
 
-      this._placeWindow(window, placement.workspaceIndex, placement.monitorIndex, placement.maximized);
+        this._placeWindow(window, placement.workspaceIndex, placement.monitorIndex, placement.maximized);
+      } catch (error) {
+        logError(error, "autospace failed to place a newly created window");
+      }
     }
   }
 
   _reconcilePlacement(placement) {
     this._refreshWindows();
     for (const window of this._windowsById.values()) {
-      if (!this._windowMatches(window, placement.match))
-        continue;
+      try {
+        if (!this._windowMatches(window, placement.match))
+          continue;
 
-      this._placeWindow(window, placement.workspaceIndex, placement.monitorIndex, placement.maximized);
+        this._placeWindow(window, placement.workspaceIndex, placement.monitorIndex, placement.maximized);
+      } catch (error) {
+        logError(error, "autospace failed to reconcile window placement");
+      }
     }
   }
 
@@ -262,7 +271,11 @@ class WindowControlService {
 
   _queuePlacementStep(callback) {
     GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-      callback();
+      try {
+        callback();
+      } catch (error) {
+        logError(error, "autospace failed to run queued placement step");
+      }
       return GLib.SOURCE_REMOVE;
     });
   }
@@ -277,17 +290,17 @@ class WindowControlService {
   }
 
   _moveWindowToMonitor(window, monitorIndex) {
-    window.move_to_monitor(monitorIndex);
-    if (window.get_monitor?.() === monitorIndex)
-      return;
-
     const geometry = global.display.get_monitor_geometry(monitorIndex);
     const frame = window.get_frame_rect?.();
-    const width = frame?.width ?? 0;
-    const height = frame?.height ?? 0;
+    if (!geometry || !frame || frame.width <= 0 || frame.height <= 0)
+      return false;
+
+    const width = Math.min(frame.width, geometry.width);
+    const height = Math.min(frame.height, geometry.height);
     const x = geometry.x + Math.max(0, Math.floor((geometry.width - width) / 2));
     const y = geometry.y + Math.max(0, Math.floor((geometry.height - height) / 2));
     window.move_frame(false, x, y);
+    return true;
   }
 
   _removePendingPlacement(placement, {removeSources = true} = {}) {
